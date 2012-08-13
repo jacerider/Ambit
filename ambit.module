@@ -1,0 +1,318 @@
+<?php
+
+define('AMBIT_DESINATION_URI', 'public://ambit');
+define('AMBIT_DESINATION_CSS_DIR', 'styles');
+define('AMBIT_DESINATION_SASS_DIR', 'sass');
+define('AMBIT_DESINATION_IMAGES_DIR', 'assets/images');
+define('AMBIT_DESINATION_FONTS_DIR', 'assets/fonts');
+
+/**
+ * Implements hook_menu().
+ */
+function ambit_menu() {
+  $items = array();
+  $items['admin/config/system/ambit'] = array(
+    'title' => 'Ambit',
+    'description' => t('Manage Ambit and Compass settings.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ambit_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'ambit.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_element_info_alter().
+ */
+function ambit_element_info_alter(&$type) {
+  array_unshift($type['styles']['#pre_render'], 'ambit_pre_render');
+}
+
+
+/**
+ * Builds the ambitcessed cache. Should only be invoked by drupal_render().
+ *
+ * @param $elements
+ *   A render array containing:
+ *   '#items': The CSS items as returned by drupal_add_css() and altered by
+ *   drupal_get_css().
+ *
+ * @return $elements
+ *   The modified (pre-rendered) $elements parameter.
+ */
+function ambit_pre_render($elements) {
+  ambit_process_assets('scss', $elements['#items']);
+  return $elements;
+}
+
+/**
+ * Main helper function which ambits an array of scss files.
+ */
+function ambit_process_assets($target_ext, &$items) {
+  $map = cache_get('ambit:map');
+  $map = $map ? $map->data : array();
+  $original = $map;
+	// Get sass files
+	$sass = ambit_sass_filter($items);
+	foreach($sass as $group => $files){
+		$build = array();
+		$import_paths = array();
+  	foreach($files as $file){
+	    $build[] = '@import "../../../../../'.$file['data'].'";';
+	    $import_paths[] = '"'.drupal_realpath($file['dirname']).'"';
+  	}
+		// Create a unique key for this file group
+		$key = implode('', array_keys($files));
+		$name = substr($group.'-'.drupal_hash_base64($key), 0, 25);
+
+		$path = AMBIT_DESINATION_URI . '/' . AMBIT_DESINATION_CSS_DIR . '/' . $name . '.css';
+		$items[$path] = $file;
+		$items[$path]['data'] = $path;
+
+		// Check to see if we already have created this exact file
+		if(!isset($map[$name])){
+			ambit_prepare_file_structure();
+			// Create sass wrapper file
+			if(!$filepath = ambit_sass_files_create($name, $build)){
+				drupal_set_message(t('Could not create file %file.', array('%file' => $name)), 'error');
+				continue;
+			}
+			// Gather assets
+			if(!ambit_sass_assets_gather($name, $files)){
+				drupal_set_message(t('Assets could not be gathered for %file.', array('%file' => $name)), 'error');
+				continue;
+			}
+
+			module_load_include('inc', 'ambit', 'ambit.compass');
+			$cmd = ambit_compass_update($name, $filepath);
+			ambit_compass_exec($cmd, $output, $errors);
+
+			$map[$name] = $filepath;
+		  //drupal_set_message(t('Saved file as %filename (accessible via !url, uri=<span id="uri">@uri</span>)', array('%filename' => $filename, '@uri' => $filename, '!url' => l(t('this URL'), $url))));
+
+		}
+	}
+
+  // If $map and $original don't match anymore that means we need to update the
+  // CSS cache.
+  if ($original !== $map) {
+    cache_set('ambit:map', $map, 'cache', CACHE_TEMPORARY);
+  }
+}
+
+/**
+ * Create a sass wrapper file
+ * 
+ * @param  string $name
+ *   The name of the file to be created
+ * @param  array $build
+ *   An array containing strings that will be imploded
+ *   
+ * @return boolean
+ *   Will return true if file was created successfully
+ */
+function ambit_sass_files_create($name, $build){
+	$output = implode("\n", $build);
+	$sass_path = AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_SASS_DIR.'/'.$name.'.scss';
+	$filename = file_unmanaged_save_data($output, $sass_path, FILE_EXISTS_REPLACE);
+	if ($filename) return $filename;
+	return FALSE;
+}
+
+/**
+ * Gather assets
+ * 
+ * @param  string $name
+ *   The name of the unique filename
+ * @param  array $files
+ *   scss files broken out by group
+ *   
+ * @return boolean
+ *   Will return true if file was created successfully
+ */
+function ambit_sass_assets_gather($name, $files){
+	$additional_folders = array();
+
+	// Module extras
+	ambit_sass_config_module_extras($files, $additional_folders);
+
+	// Theme extras
+	ambit_sass_config_theme_extras($files, $additional_folders);
+
+	// Save all files in extras folder to a temporary folder
+	return abmit_sass_assets_create($name, $additional_folders);
+}
+
+/**
+ * Save assets from additional folders
+ */
+function abmit_sass_assets_create($name, $additional_folders){
+	$success = TRUE;
+	foreach($additional_folders as $type => $folders){
+		foreach($folders as $folder){
+			$source = drupal_realpath($folder);
+			switch($type){
+				case 'fonts':
+					$dest = drupal_realpath(AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_FONTS_DIR.'/'.$name);
+					break;
+				case 'images':
+					$dest = drupal_realpath(AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_IMAGES_DIR.'/'.$name);
+					break;
+			}
+			if(!ambit_copyr($source, $dest)){
+				drupal_set_message(t('Asset type %type failed to copy from %folder.', array('%type' => $type, '%folder' => $source)), 'error');
+				$success = TRUE;
+				continue;
+			}
+			// All assets have been coppied
+		}
+	}
+	return $success;
+}
+
+/**
+ * Gets any extras specifed by a module loading a scss file
+ */
+function ambit_sass_config_module_extras($files, &$additional_folders){
+	foreach($files as $path =>$file){
+		$extras = isset($file['ambit']) ? $file['ambit'] : array();
+		if(!empty($extras)){
+			if(isset($extras['module'])){
+				$module = $extras['module'];
+				unset($extras['module']);
+			}else{
+				drupal_set_message(t('Module name not specified when trying to include %file.', array('%file' => $path)), 'error');
+				continue;
+			}
+			foreach($extras as $type => $folder){
+				$include_path = drupal_get_path('module', $module);
+				$additional_folders[$type][] = $include_path.'/'.$folder;
+			}
+		}
+	}
+}
+
+/**
+ * Gets any extras specifed by a theme loading a scss file
+ */
+function ambit_sass_config_theme_extras($files, &$additional_folders){
+  drupal_theme_initialize();
+  $themes = list_themes();
+  foreach($themes as $theme){
+  	$all = array();
+  	if(isset($theme->stylesheets['all'])) $all += $theme->stylesheets['all'];
+  	if(isset($theme->stylesheets['screen'])) $all += $theme->stylesheets['screen'];
+  	foreach($all as $theme_css){
+  		if(array_key_exists($theme_css, $files)){
+  			$extras = !empty($theme->info['ambit']) ? $theme->info['ambit'] : array();
+  			foreach($extras as $type => $folder){
+  				$include_path = drupal_get_path('theme', $theme->name);
+					$additional_folders[$type][] = $include_path.'/'.$folder;
+  			}
+
+  		}
+  	}
+  }
+}
+
+/**
+ * Gets a list of sass files
+ * 
+ * @param  array $items
+ *   An array of files about to be sent for processing
+ *   
+ * @return array $sass
+ *   An array of files only containing sass files
+ */
+function ambit_sass_filter(&$items){
+	$sass = array();
+	foreach($items as $path => $file){
+    if ($file['type'] != 'file') {
+      continue;
+    }
+		$parts = pathinfo($path);
+    if (!isset($parts['extension'])) {
+      continue;
+    }
+		if($parts['extension'] == 'scss'){
+			$file += $parts;
+			// Seperate page files into two groups
+			// 1. Files loaded on EVERY PAGE
+			// 2. Files loaded just on this page
+	    if($file['every_page'] === TRUE){
+	    	$sass['global'][$path] = $file;
+	    }else{
+	    	$sass['page'][$path] = $file;
+	    }
+	    // Remove the SCSS files from the main files list
+	    // We will add them back again later
+			unset($items[$path]);
+		}
+	}
+	return $sass;
+}
+
+/**
+ * Create all necessary folders
+ */
+function ambit_prepare_file_structure(){
+	$folder = AMBIT_DESINATION_URI;
+	file_prepare_directory($folder, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+	$folder = AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_SASS_DIR;
+	file_prepare_directory($folder, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+	$folder = AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_IMAGES_DIR;
+	file_prepare_directory($folder, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+	$folder = AMBIT_DESINATION_URI.'/'.AMBIT_DESINATION_FONTS_DIR;
+	file_prepare_directory($folder, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+}
+
+/** 
+ * Copy a file, or recursively copy a folder and its contents 
+ * 
+ * @param string $source    
+ *   Source path 
+ * @param string $dest
+ *   Destination path 
+ *   
+ * @return bool
+ *   Returns TRUE on success, FALSE on failure 
+ */ 
+function ambit_copyr($source, $dest) { 
+  // Simple copy for a file 
+  if (is_file($source)) {
+    return file_unmanaged_copy($source, $dest); 
+  } 
+  // Make destination directory 
+  if (!is_dir($dest)) { 
+		file_prepare_directory($dest, FILE_MODIFY_PERMISSIONS | FILE_CREATE_DIRECTORY);
+  }
+  // Loop through the folder 
+  $dir = dir($source); 
+  while (false !== $entry = $dir->read()) { 
+    // Skip pointers 
+    if ($entry == '.' || $entry == '..') { 
+      continue; 
+    } 
+    // Deep copy directories 
+    if ($dest !== "$source/$entry") { 
+      ambit_copyr("$source/$entry", "$dest/$entry"); 
+    } 
+  }
+  // Clean up 
+  $dir->close(); 
+  return true; 
+} 
+
+/**
+ * Implementation of hook_flush_caches().
+ */
+function ambit_flush_caches() {
+  ambit_clear_cache();
+}
+/**
+ * Deletes old cached SCSS files.
+ */
+function ambit_clear_cache() {
+	file_scan_directory(AMBIT_DESINATION_URI, '/.*/', array('recure'=>TRUE, 'callback' => 'file_unmanaged_delete_recursive'));
+}
